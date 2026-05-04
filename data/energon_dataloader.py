@@ -186,18 +186,18 @@ class SingleBatchEncoder(TaskEncoder):
         self.EOS_token  = self.tokenizer.eos_token_id
 
     cookers = [
-        # subflavors can be used here to distinguish datasets when using a Metadataset
+        # fallback cooker for samples without subflavors
         Cooker(cooker_captioning),
     ]
 
     # transform the RAW data, tokenize a single sample
-    def encode_sample(self, sample: InterleavedSample) -> EncodedSample:
+    def encode_sample(self, sample: EnergonSample) -> EncodedSample:
         text = self.processor.apply_chat_template(
-            conversation=sample.sequence[1],
+            conversation=sample.messages,
             tokenize=False,
             add_generation_prompt=False,
         )
-        inputs = self.processor(text=[text], images=[sample.sequence[0]], padding=False, return_tensors="pt")
+        inputs = self.processor(text=[text], images=[sample.image], padding=False, return_tensors="pt")
 
         input_ids = inputs['input_ids']
 
@@ -277,8 +277,8 @@ class PackedBatchEncoder(TaskEncoder):
         self.EOS_token  = self.tokenizer.eos_token_id
 
     cookers = [
-        # subflavors can be used to distinguish datasets when using a Metadataset
-        Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth"}),
+        # fallback cooker for samples without subflavors
+        Cooker(cooker_captioning),
         Cooker(cooker_llava_imagenet, has_subflavors={"type_dataset": "llava_onevision_midtraining"}),
     ]
 

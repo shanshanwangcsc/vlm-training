@@ -5,7 +5,7 @@ import torch
 import wandb
 import transformers
 from itertools import cycle
-
+import psutil
 import time
 
 from transformers import AutoProcessor
@@ -58,7 +58,24 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-
+def set_cpu_affinity(local_rank):
+    LUMI_GPU_CPU_map = {
+        # A mapping from GCD to the closest CPU cores in a LUMI-G node
+        # Note that CPU cores 0, 8, 16, 24, 32, 40, 48, 56 are reserved for the
+        # system and not available for the user
+        # See https://docs.lumi-supercomputer.eu/hardware/lumig/
+        0: [49, 50, 51, 52, 53, 54, 55],
+        1: [57, 58, 59, 60, 61, 62, 63],
+        2: [17, 18, 19, 20, 21, 22, 23],
+        3: [25, 26, 27, 28, 29, 30, 31],
+        4: [1, 2, 3, 4, 5, 6, 7],
+        5: [9, 10, 11, 12, 13, 14, 15],
+        6: [33, 34, 35, 36, 37, 38, 39],
+        7: [41, 42, 43, 44, 45, 46, 47],
+    }
+    cpu_list = LUMI_GPU_CPU_map[local_rank]
+    print(f"Rank {int(os.environ['RANK'])} (local {local_rank}) binding to cpus: {cpu_list}")
+    psutil.Process().cpu_affinity(cpu_list)
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     @record
@@ -73,6 +90,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.local_rank = int(os.environ["LOCAL_RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(self.local_rank)
+        
+        set_cpu_affinity(self.local_rank)
 
         self.mesh = get_mesh(self.training_args, self.world_size)
         self.tp_group = get_tp_group(self.mesh)
@@ -428,8 +447,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         tflops_per_sec = flops_per_sec / 1e12
 
         # GB200 (JUP) and SXM H100 (MN5)
-        peak_tflops_per_gpu = 989.4
-
+        #peak_tflops_per_gpu = 989.4
+        
+        peak_tflops_per_gpu = 191.5 
         # L40S
         #peak_tflops_per_gpu = 362
 
