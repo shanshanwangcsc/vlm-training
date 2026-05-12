@@ -1,0 +1,45 @@
+[model]
+model_name = "Qwen/Qwen3.5-9B"
+model_impl = "native"
+
+train_llm = true
+train_mlp = true
+train_vit = false
+
+[wandb]
+run_name = "qwen3-5_9b_lumi"
+project_name = "qwen3-5_9b"
+entity_name = "shanshan-wang-csc-csc"
+
+[training]
+model_dir = "cache/qwen3_5_9b"
+output_dir = "checkpoints"
+
+tpi_multiplier = 1.0
+save_steps = 200
+
+scheduler_type = "cosine"
+total_steps = 200
+warmup_steps = 50
+#wsd_decay_ratio = 0.1
+min_lr_ratio = 0.1
+
+lr_llm = 0.00002
+lr_mlp = 0.0001
+
+data_parallel = 'fsdp'
+tp_size = 4
+
+resume_checkpoint = false
+random_init = false
+
+ac_mode = "full"
+compile = false
+async_tp = false
+
+[data]
+data_path = "/scratch/project_462001202/shanshan/synth-data-bench-training/data/cap_pretrain"
+#data_path = "/flash/project_462001202/shanshan/synth-data-bench-training/data/cap_pretrain"
+seq_len = 4096
+
+batch_size = 64

@@ -43,6 +43,10 @@ from torch.utils.checkpoint import (
     CheckpointPolicy,
     create_selective_checkpoint_contexts,
 )
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from functools import partial
 
 class NoParallel(ParallelStyle):
     def __init__(
@@ -277,9 +281,8 @@ def apply_fsdp_qwen3(model, mesh, reshard_after_forward_policy='never'):
 
     fully_shard(model, mesh=mesh)
 
-def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
+""" def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
     model = model.model
-
     match reshard_after_forward_policy:
         case "always":
             reshard_after_forward = True
@@ -295,30 +298,78 @@ def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
             raise ValueError(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
             )
-
-    # text decoder
-    for transformer_block in model.language_model.layers:
-        fully_shard(
-            transformer_block,
-            mesh=mesh,
-            reshard_after_forward=reshard_after_forward,
-        )
-
-    # vision encoder
-    for transformer_block in model.visual.blocks:
-        fully_shard(
-            transformer_block,
-            mesh=mesh,
-            reshard_after_forward=reshard_after_forward,
-        )
-
-    fully_shard(
-        [model.language_model.norm, model.language_model.embed_tokens],
-        mesh=mesh,
+    # Define transformer layer classes for the auto-wrap policy
+    transformer_layer_cls = {
+        type(model.visual.blocks[0]),     # Vision transformer block
+        type(model.language_model.layers[0]),  # Language transformer block
+    }
+    
+    # Create the auto-wrap policy
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls=transformer_layer_cls
+    )
+    
+    # Apply FSDP with auto-wrap
+    model = FSDP(
+        model,
+        device_mesh=mesh,
+        auto_wrap_policy=auto_wrap_policy,
+        #reshard_after_forward=(reshard_after_forward_policy == "always"),
         reshard_after_forward=reshard_after_forward_policy == "always",
+
+    )
+    
+    return model  """
+
+def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy="never"):
+    model = model.model
+
+    match reshard_after_forward_policy:
+        case "always":
+            reshard_after_forward = True
+        case "never":
+            reshard_after_forward = False
+        case "default":
+            reshard_after_forward = True
+        case _:
+            raise ValueError(
+                f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
+            )
+
+    # --- Text decoder (per-block wrapping) ---
+    for block in model.language_model.layers:
+        fully_shard(
+            block,
+            mesh=mesh,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+    # --- Vision encoder (wrap ONCE, whole module) ---
+    fully_shard(
+        model.visual,
+        mesh=mesh,
+        reshard_after_forward=reshard_after_forward,
     )
 
+    # --- Other components ---
+    fully_shard(
+        model.language_model.norm,
+        mesh=mesh,
+        reshard_after_forward=reshard_after_forward,
+    )
+
+    fully_shard(
+        model.language_model.embed_tokens,
+        mesh=mesh,
+        reshard_after_forward=reshard_after_forward,
+    )
+
+    # --- Root ---
     fully_shard(model, mesh=mesh)
+
+    return model
+
 
 def apply_tp(
         model,

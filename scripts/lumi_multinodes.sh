@@ -9,6 +9,7 @@
 #SBATCH --mem=480G
 #SBATCH --output=logs/%j/log_%x.out
 #SBATCH --error=logs/%j/errors/rank_%t.err
+#SBATCH --exclude=nid005002,nid005019
 
 # ---------- Modules ----------
 module --force purge
@@ -64,7 +65,7 @@ CPU_BIND_MASKS="0x00fe000000000000,0xfe00000000000000,0x0000000000fe0000,0x00000
 srun --cpu-bind=none singularity run --env PYTHONPATH=$PYTHONPATH:\$PYTHONPATH ${SIF} bash -c "python -m torch.distributed.run \
 --nnodes=$SLURM_JOB_NUM_NODES --nproc_per_node=$SLURM_GPUS_PER_NODE \
 --rdzv_id=\$SLURM_JOB_ID --rdzv_backend=c10d --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \
--m train.train_qwen --config configs/lumi/qwen3_2b.toml"
+-m train.train_qwen --config configs/lumi/qwen3_5_9b.toml"
 
 #srun singularity run --env PYTHONPATH=$PYTHONPATH:\$PYTHONPATH ${SIF} bash -c "python -m torch.distributed.run \
 #--nnodes=$SLURM_JOB_NUM_NODES --nproc_per_node=$SLURM_GPUS_PER_NODE \

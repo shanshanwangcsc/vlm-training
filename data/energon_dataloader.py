@@ -168,13 +168,6 @@ class EncodedSample:
 
 
 class SingleBatchEncoder(TaskEncoder):
-    """
-    Given a batch size it builds a sequence. The attention mask is created with cu_seqlens, built for FlashAttention varlen.
-    Does NOT perform data packing. Use in datasets where the sample sequence size does not vary.
-
-    - CrudeWebdataset Energon dataset as input
-    - The token for "assistant" has to be a single token. This is the case for the Qwen3-VL and Qwen3.5 tokenizers.
-    """
     def __init__(self, processor, max_seq_len):
         super().__init__()
         self.processor = processor
@@ -198,9 +191,7 @@ class SingleBatchEncoder(TaskEncoder):
             add_generation_prompt=False,
         )
         inputs = self.processor(text=[text], images=[sample.image], padding=False, return_tensors="pt")
-
         input_ids = inputs['input_ids']
-
         labels = torch.full_like(input_ids, -100)
         input_ids_flat = input_ids[0].tolist()
         L = len(input_ids_flat)
@@ -260,10 +251,9 @@ class SingleBatchEncoder(TaskEncoder):
             batch_out["pixel_values"] = torch.cat(valid_pixel_values, dim=0)
             
         valid_grid_thw = [s.image_grid_thw for s in samples if s.image_grid_thw is not None]
-        if valid_grid_thw:
+        if valid_grid_thw:  
             batch_out["image_grid_thw"] = torch.cat(valid_grid_thw, dim=0)
-            
-        return batch_out
+        return batch_out 
 
 class PackedBatchEncoder(TaskEncoder):
     def __init__(self, processor, max_seq_len):

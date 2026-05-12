@@ -120,7 +120,8 @@ class SelfAttention(nn.Module):
             q, k, v,
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
-            window_size=(-1, 0),  # causal
+            #window_size=(-1, 0),  # causal
+            is_causal=True,
         )
         out = _dtensor_rewrap(out, wrap)
 
@@ -375,7 +376,8 @@ class VisionAttention(nn.Module):
             q, k, v,
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
-            window_size=(-1, -1),  # non-causal
+            #window_size=(-1, -1),  # non-causal
+            is_causal=False,
         )
         out = _dtensor_rewrap(out, wrap)
         return self.proj(out.reshape(S, self.dim))
@@ -466,6 +468,8 @@ class VisionModel(nn.Module):
         return emb.flatten(1)  # (total, dim)
 
     def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        assert grid_thw.dim() == 2 and grid_thw.size(1) == 3, \
+            f"Expected grid_thw shape (N,3), got {grid_thw.shape}"
         grid_list = grid_thw.tolist()
         grid_ts = [r[0] for r in grid_list]
         grid_hs = [r[1] for r in grid_list]
@@ -679,6 +683,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         (same tensor consumed by `torch.nn.attention.varlen.varlen_attn`).
         If `attention_mask` is None, the whole row is treated as one sample.
         """
+        if image_grid_thw is not None and image_grid_thw.ndim == 1:
+            image_grid_thw = image_grid_thw.unsqueeze(0)
+        if video_grid_thw is not None and video_grid_thw.ndim == 1:
+            video_grid_thw = video_grid_thw.unsqueeze(0)
         assert (input_ids is None) ^ (inputs_embeds is None)
         if input_ids is not None and input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)

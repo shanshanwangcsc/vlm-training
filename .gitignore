@@ -14,6 +14,7 @@ logs
 checkpoints
 debug
 tests_debug
-
+cache
+tea_debug.log
 trace_dir/*
 !trace_dir/view_trace.sh

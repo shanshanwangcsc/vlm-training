@@ -47,4 +47,4 @@ srun singularity run --env PYTHONPATH=$PYTHONPATH:\$PYTHONPATH ${SIF} bash -c "p
 --nnodes=$SLURM_JOB_NUM_NODES --nproc_per_node=$SLURM_GPUS_PER_NODE \
 --master_addr=$MASTER_ADDR \
 --master_port=$MASTER_PORT \
--m train.train_qwen --config configs/lumi/qwen3_2b.toml"
+-m train.train_qwen --config configs/lumi/qwen3_8b.toml"

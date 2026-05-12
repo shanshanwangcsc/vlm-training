@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from safetensors.torch import safe_open
 from torch.nn.attention.varlen import varlen_attn
 
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
 from train.logger import logger
 
@@ -27,8 +27,20 @@ def dispatch_varlen_attention(
     cu_seqlens, 
     max_seqlen
 ):
+    # Handle DTensor: unwrap to local for kernels that don't support DTensor.
+    # flash_attn and varlen_attn currently don't have DTensor dispatch rules.
+    is_dtensor = isinstance(q, DTensor)
+    if is_dtensor:
+        mesh = q.device_mesh
+        q_placements = q.placements
+        q = q.to_local()
+        k = k.to_local() if isinstance(k, DTensor) else k
+        v = v.to_local() if isinstance(v, DTensor) else v
+        if isinstance(cu_seqlens, DTensor):
+            cu_seqlens = cu_seqlens.to_local()
+
     if HAS_FLASH:
-        return flash_attn_varlen_func(
+        out = flash_attn_varlen_func(
             q, k, v,
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
@@ -37,12 +49,16 @@ def dispatch_varlen_attention(
             causal=True,
         )
     else:
-        return varlen_attn(
+        out = varlen_attn(
             q, k, v,
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, 0),  # causal
         )  # (total, num_heads, head_dim)
+    
+    if is_dtensor:
+        out = DTensor.from_local(out, mesh, q_placements)
+    return out
 
 @dataclass
 class CausalLMOutput:
@@ -193,6 +209,14 @@ def apply_rope(
         sin = sin.unsqueeze(0)
     cos = cos.unsqueeze(1)  # (B, 1, S, D)
     sin = sin.unsqueeze(1)
+
+    # When q/k are DTensors (from TP-parallelized projections) but cos/sin
+    # are plain tensors, promote cos/sin to Replicate DTensors on the same
+    # mesh so that aten.mul doesn't mix Tensor and DTensor operands.
+    if isinstance(q, DTensor) and not isinstance(cos, DTensor):
+        mesh = q.device_mesh
+        cos = DTensor.from_local(cos, device_mesh=mesh, placements=[Replicate()])
+        sin = DTensor.from_local(sin, device_mesh=mesh, placements=[Replicate()])
 
     q_out = (q * cos) + (rotate_half(q) * sin)
     k_out = (k * cos) + (rotate_half(k) * sin)
