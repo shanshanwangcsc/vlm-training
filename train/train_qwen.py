@@ -5,8 +5,12 @@ import torch
 import wandb
 import transformers
 from itertools import cycle
-import psutil
+
 import time
+import contextlib
+import cProfile
+import pstats
+import io
 
 from transformers import AutoProcessor
 
@@ -54,28 +58,12 @@ from train.utils import (
 )
 
 torch._logging.set_logs(graph_code=True)
+torch._inductor.config.fx_graph_cache = True
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-def set_cpu_affinity(local_rank):
-    LUMI_GPU_CPU_map = {
-        # A mapping from GCD to the closest CPU cores in a LUMI-G node
-        # Note that CPU cores 0, 8, 16, 24, 32, 40, 48, 56 are reserved for the
-        # system and not available for the user
-        # See https://docs.lumi-supercomputer.eu/hardware/lumig/
-        0: [49, 50, 51, 52, 53, 54, 55],
-        1: [57, 58, 59, 60, 61, 62, 63],
-        2: [17, 18, 19, 20, 21, 22, 23],
-        3: [25, 26, 27, 28, 29, 30, 31],
-        4: [1, 2, 3, 4, 5, 6, 7],
-        5: [9, 10, 11, 12, 13, 14, 15],
-        6: [33, 34, 35, 36, 37, 38, 39],
-        7: [41, 42, 43, 44, 45, 46, 47],
-    }
-    cpu_list = LUMI_GPU_CPU_map[local_rank]
-    print(f"Rank {int(os.environ['RANK'])} (local {local_rank}) binding to cpus: {cpu_list}")
-    psutil.Process().cpu_affinity(cpu_list)
+
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     @record
@@ -90,8 +78,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.local_rank = int(os.environ["LOCAL_RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(self.local_rank)
-        
-        set_cpu_affinity(self.local_rank)
 
         self.mesh = get_mesh(self.training_args, self.world_size)
         self.tp_group = get_tp_group(self.mesh)
@@ -227,7 +213,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             rank=data_rank,
             world_size=data_world_size,
             data_parallel_group=self.dp_group,
-            num_workers=1,
+            num_workers=2,
         )
 
         task_encoder, extra_ds_kwargs = build_task_encoder(
@@ -237,8 +223,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         ds = get_train_dataset(
             self.data_args.data_path,
-            #batch_size=1,
-            batch_size=self.data_args.batch_size,
+            batch_size=1,
             shuffle_buffer_size=self.data_args.shuffle_buffer_size,
             max_samples_per_sequence=self.data_args.max_samples_per_sequence,
             task_encoder=task_encoder,
@@ -286,7 +271,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 continue
             if "visual.merger" in n:
                 mlp_params.append(p)
-            elif "visual.deepstack_merger_list":
+            elif "visual.deepstack_merger_list" in n:
                 mlp_params.append(p)
             elif "visual.patch_embed" in n:
                 vision_params.append(p)
@@ -408,17 +393,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             if batch['cu_seqlens'].ndim > 1:
                 batch['cu_seqlens'].squeeze_()
-            #breakpoint()
 
-            """ if batch['image_grid_thw'].ndim > 1:
+            if batch['image_grid_thw'].ndim > 1:
                 # do not use squeeze because we need to have two dims
-                batch['image_grid_thw'] = batch['image_grid_thw'][0] """
+                batch['image_grid_thw'] = batch['image_grid_thw'][0]
 
             batch['attention_mask'], batch['original_mask'] = batch['cu_seqlens'], batch['attention_mask']
 
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
-                    batch[k] = v.to(self.device, non_blocking=True)
+                    batch[k] = v.to(device=torch.cuda.current_device(), non_blocking=True)
 
             # the first and last numbers in cu_seqlens do not count towards the sample count
             # (pun intented)
@@ -450,8 +434,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # GB200 (JUP) and SXM H100 (MN5)
         #peak_tflops_per_gpu = 989.4
-        
-        peak_tflops_per_gpu = 191.5 
+        peak_tflops_per_gpu = 191.5
         # L40S
         #peak_tflops_per_gpu = 362
 
@@ -567,6 +550,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         return False
 
+    def _dump_cprofile(self, prof: cProfile.Profile) -> None:
+        out_path = os.path.join(
+            self.training_args.output_dir, f"cprofile_rank_{self.rank()}.txt"
+        )
+        stream = io.StringIO()
+        pstats.Stats(prof, stream=stream).sort_stats("cumulative").print_stats(50)
+        with open(out_path, "w") as f:
+            f.write(stream.getvalue())
+        logger.info(f"cProfile stats written to {out_path}")
+
     def train(self):
         data_iterator = self.batch_generator()
 
@@ -591,33 +584,68 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 logger.info('could not resume')
                 raise Exception("Could not found initial checkpoint, killing run")
         
-        # Custom handler for Chrome Trace export instead of TensorBoard
         def trace_handler(prof):
-            trace_path = os.path.join(self.training_args.output_dir, f"trace_rank_{self.rank()}_step_{prof.step_num}.json")
+            trace_path = os.path.join(
+                self.training_args.output_dir,
+                f"trace_rank_{self.rank()}_step_{prof.step_num}.json",
+            )
             prof.export_chrome_trace(trace_path)
+            summary_path = trace_path.replace(".json", "_summary.txt")
+            with open(summary_path, "w") as f:
+                f.write(prof.key_averages(group_by_stack_n=5).table(
+                    sort_by="self_cpu_time_total", row_limit=40
+                ))
             if self.if_log_rank():
-                logger.info(f"Profiler trace saved to: {trace_path}")
+                logger.info(f"Torch profiler trace → {trace_path}")
+                logger.info(f"Torch profiler summary → {summary_path}")
 
-        prof_schedule = schedule(wait=5, warmup=2, active=3, repeat=1)
+        if self.debug_mode:
+            # wait=30 skips the torch.compile warmup steps; active=5 records 5 full steps
+            prof_schedule = schedule(wait=30, warmup=2, active=100, repeat=1)
+            prof_ctx = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=prof_schedule,
+                on_trace_ready=trace_handler,
+                record_shapes=True,
+                profile_memory=False,
+                with_stack=True,
+            )
+            # cProfile window: steady-state steps well after compilation
+            _cprof = cProfile.Profile()
+            _CPROF_START = 50
+            _CPROF_STOP = 65
+        else:
+            prof_ctx = contextlib.nullcontext()
+            _cprof = None
+        _cprof_active = False
 
-        #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], schedule=prof_schedule, on_trace_ready=trace_handler, record_shapes=True, profile_memory=True, with_stack=True) as prof:
-        try:
-            while self.global_step < self.training_args.total_steps:
-                self.micro_step += 1
-                
-                # training step executed here
-                optimizer_updated = self.train_step(data_iterator, optimizer)
+        with prof_ctx as prof:
+            try:
+                while self.global_step < self.training_args.total_steps:
+                    self.micro_step += 1
 
-                if optimizer_updated:
-                    scheduler.step()
-                    # Save checkpoint only if we haven't reached the target steps
-                    if self.may_save() and self.global_step < self.training_args.total_steps:
-                        self.save_checkpoint()
-                #prof.step()
+                    if self.debug_mode and not _cprof_active and self.global_step >= _CPROF_START:
+                        _cprof.enable()
+                        _cprof_active = True
 
-        except StopIteration as e:
-            if self.if_log_rank():
-                logger.info(f"data iterator exhausted at step {self.global_step}: {e}")
+                    optimizer_updated = self.train_step(data_iterator, optimizer)
+                    if prof is not None:
+                        prof.step()
+
+                    if optimizer_updated:
+                        scheduler.step()
+
+                        if _cprof_active and self.global_step >= _CPROF_STOP:
+                            _cprof.disable()
+                            _cprof_active = False
+                            self._dump_cprofile(_cprof)
+
+                        if self.may_save() and self.global_step < self.training_args.total_steps:
+                            self.save_checkpoint()
+
+            except StopIteration as e:
+                if self.if_log_rank():
+                    logger.info(f"data iterator exhausted at step {self.global_step}: {e}")
 
         if self.if_log_rank():
             logger.info(f"tokens seen: {self.tokens_seen}")
@@ -640,4 +668,3 @@ if __name__ == "__main__":
 
     trainer = Trainer(config)
     trainer.train()
-    

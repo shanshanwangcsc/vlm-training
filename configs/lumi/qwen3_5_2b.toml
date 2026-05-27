@@ -20,7 +20,7 @@ tpi_multiplier = 1.0
 save_steps = 200
 
 scheduler_type = "cosine"
-total_steps = 500
+total_steps = 200
 warmup_steps = 10
 #wsd_decay_ratio = 0.1
 min_lr_ratio = 0.1
