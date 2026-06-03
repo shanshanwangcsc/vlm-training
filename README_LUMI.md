@@ -33,3 +33,13 @@ sbatch --nodes 1 --partition dev-g scripts/lumi.sh configs/lumi/qwen3_5_2b.toml
 #!/bin/bash
 sbatch --nodes 1 --partition dev-g scripts/lumi.sh configs/lumi/qwen3_5_9b.toml
 ```
+## Scaling plots
+The scaling experiments are done with 1 node (8 GPUs), 16 (128 GPUs) nodes and 64 (256 GPUs) nodes on LUMI.
+## Qwen3VL-2b
+![Qwen3VL-2b](qwen_3vl_2b.png)
+## Qwen3VL-8b
+![Qwen3VL-8b](qwen_3vl_8b.png)
+## Qwen3.5-2b
+![Qwen3.5-2b](qwen_3_5_2b.png)
+## Qwen3.5-9b
+![Qwen3.5-9b](qwen_3_5_9b.png)
