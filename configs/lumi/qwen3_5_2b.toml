@@ -17,10 +17,10 @@ model_dir = "cache/qwen3_5_2b"
 output_dir = "checkpoints"
 
 tpi_multiplier = 1.0
-save_steps = 200
+save_steps = 100
 
 scheduler_type = "cosine"
-total_steps = 200
+total_steps = 100
 warmup_steps = 10
 #wsd_decay_ratio = 0.1
 min_lr_ratio = 0.1
@@ -40,8 +40,8 @@ compile = false
 data_path = "/scratch/project_462001202/shanshan/synth-data-bench-training/data/cap_pretrain"
 
 seq_len = 4096
-
-packing_buffer_size = 100
-
+packing_buffer_size = 1000
+max_samples_per_sequence = 400
+shuffle_buffer_size=4000
 batch_size = 0
 

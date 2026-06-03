@@ -193,11 +193,11 @@ class SingleBatchEncoder(TaskEncoder):
     # transform the RAW data, tokenize a single sample
     def encode_sample(self, sample: InterleavedSample) -> EncodedSample:
         text = self.processor.apply_chat_template(
-            conversation=sample.sequence[1],
+            conversation=sample.messages,
             tokenize=False,
             add_generation_prompt=False,
         )
-        inputs = self.processor(text=[text], images=[sample.sequence[0]], padding=False, return_tensors="pt")
+        inputs = self.processor(text=[text], images=[sample.image], padding=False, return_tensors="pt")
 
         input_ids = inputs['input_ids']
 
@@ -290,6 +290,7 @@ class PackedBatchEncoder(TaskEncoder):
             tokenize=False,
             add_generation_prompt=False,
         )
+        #breakpoint()
         inputs = self.processor(text=[text], images=[sample.image], padding=False, return_tensors="pt")
 
         input_ids = inputs['input_ids']

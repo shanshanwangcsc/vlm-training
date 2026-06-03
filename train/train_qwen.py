@@ -68,6 +68,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     @record
     def __init__(self, cfg: Config):
+        
         self.model_args = cfg.model
         self.training_args = cfg.training
         self.data_args = cfg.data
@@ -213,7 +214,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             rank=data_rank,
             world_size=data_world_size,
             data_parallel_group=self.dp_group,
-            num_workers=2,
+            num_workers=1,
         )
 
         task_encoder, extra_ds_kwargs = build_task_encoder(
@@ -230,6 +231,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             worker_config=worker_config,
             **extra_ds_kwargs,
         )
+        #breakpoint()
 
         self.data_loader = get_loader(ds)
 
@@ -237,6 +239,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.global_step = 0
         self.micro_step = 0
+        self.fwd_bwd_time = 0.0
+        self.data_time_total = 0.0
 
         self.tokens_seen = 0
         self.tokens_seen_assistant = 0
@@ -246,6 +250,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.samples_since_last_log = 0
 
         self.time_last_log = time.perf_counter()
+        
         self.color = Color()
 
     def rank(self):
@@ -256,7 +261,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     def create_optimizer(self):
         if self.optimizer is not None:
-            return self.optimizer
+            return self.optimizer, self.scheduler
 
         lr_mlp = self.training_args.lr_mlp
         lr_vit = self.training_args.lr_vit
@@ -368,6 +373,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         except Exception as e:
             logger.info(f"rank: {self.rank()}")
             logger.info(f"exception during checkpointing: {e}")
+            raise
         else:
             self.tokens_seen = state_dict['tokens_seen']
             self.tokens_seen_assistant = state_dict['tokens_seen_assistant']
@@ -415,40 +421,49 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.tokens_seen_assistant += ntokens_batch_assistant
             self.tokens_seen += ntokens_batch
             self.ntokens_since_last_log += ntokens_batch
-            self.total_ntokens_since_last_log += self.data_args.seq_len
+            #self.total_ntokens_since_last_log += self.data_args.seq_len
+            self.total_ntokens_since_last_log += ntokens_batch
             self.samples_since_last_log += batch_samples
 
-            self.data_time_delta = time.perf_counter() - data_start_time
+            self.data_time_total += time.perf_counter() - data_start_time
 
             yield batch
 
-    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr):
+    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr,interval_tokens):
 
-        time_delta = time.perf_counter() - self.time_last_log
+        time_delta = self.train_step_delta
 
-        tps = self.ntokens_since_last_log / time_delta
+        dp_size = self.dp_group.size()
+        tp_size = max(1, self.training_args.tp_size)
 
-        step_flops = self.flops_per_token * self.total_ntokens_since_last_log
-        flops_per_sec = step_flops / time_delta
-        tflops_per_sec = flops_per_sec / 1e12
+        # aggregate throughput across all DP workers
+        global_tps = interval_tokens / time_delta
 
-        # GB200 (JUP) and SXM H100 (MN5)
-        #peak_tflops_per_gpu = 989.4
+        # throughput per GPU/GCD
+        tps_per_gcd = global_tps / dp_size
+
+        # FLOPs
+        global_flops_per_sec = (self.flops_per_token * global_tps)
+
+        per_gpu_flops_per_sec = (global_flops_per_sec /(dp_size * tp_size))
+
+        tflops_per_gpu = per_gpu_flops_per_sec / 1e12
+
         peak_tflops_per_gpu = 191.5
-        # L40S
-        #peak_tflops_per_gpu = 362
-
-        mfu = (flops_per_sec / (peak_tflops_per_gpu * 1e12)) * 100
+        mfu = 100.0 * tflops_per_gpu / peak_tflops_per_gpu
 
         color = self.color
 
-        data_time_pct = (self.data_time_delta / time_delta) * 100
+
+        data_time_pct = (self.data_time_total / time_delta) * 100
 
         logger.info(
             f"{color.red}step {self.global_step} "
                 f"{color.green}loss {avg_loss:.4f} "
-                f"{color.blue}tps {tps:.2f} "
+                f"{color.blue}global_tps {global_tps:.2f} "
+                f"tps_per_gcd {tps_per_gcd:.0f} "
                 f"{color.magenta}mfu {mfu:.1f}% "
+                f"{color.yellow}tflops {tflops_per_gpu:.1f} "
                 f"{color.reset}"
                 f"time {self.train_step_delta:.3f}s "
                 f"fwd {self.fwd_bwd_time:.3f}s "
@@ -467,11 +482,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "train/batch_efficiency": self.batch_efficiency,
 
             # performance related
-            "perf/tokens_per_second": tps,
+            "perf/tokens_per_second": global_tps,
+            "perf/tps_per_gcd": tps_per_gcd,
             "perf/data_time_pct": data_time_pct,
             "perf/step_time": self.train_step_delta,
             "perf/fwd_bwd_time": self.fwd_bwd_time,
-            "perf/tflops_per_second": tflops_per_sec,
+            "perf/tflops_per_gpu": tflops_per_gpu,
             "perf/mfu": mfu,
         }
 
@@ -484,22 +500,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_count = 0
 
     def train_step(self, data_iterator, optimizer):
+        
         batch = next(data_iterator)
-
+        #breakpoint()
         s_model = time.perf_counter()
+        
         with record_function("forward_pass"):
             with torch.autocast('cuda', torch.bfloat16):
                 outputs = self.model(
                     **batch
                 )
                 loss = outputs.loss
-
+                #breakpoint()
+        
         with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target
             with torch.autocast('cuda', torch.bfloat16):
                 scaled_loss.backward()
-
-        self.fwd_bwd_time = time.perf_counter() - s_model
+        
+        self.fwd_bwd_time += time.perf_counter() - s_model
 
         self.current_accum_count += 1
 
@@ -507,12 +526,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with record_function("optimizer_step"):
                 optimizer.step()
                 optimizer.zero_grad()
-
+            
             lr = optimizer.param_groups[0]['lr']
 
             self.global_step += 1
 
-            avg_loss, max_loss, global_tokens, global_assistant, global_samples = (
+            avg_loss, max_loss, global_tokens, global_assistant, global_samples, interval_tokens= (
                 dist_mean(loss, self.dp_group),
                 dist_max(loss, self.dp_group),
                 dist_sum(
@@ -530,14 +549,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 dist_sum(
                     torch.tensor(self.samples_since_last_log, dtype=torch.int32, device=self.device),
                     self.dp_group,
-                )
+                ),
+                dist_sum(torch.tensor(self.total_ntokens_since_last_log,dtype=torch.int64,device=self.device,),self.dp_group,)
             )
 
-            self.train_step_delta = (time.perf_counter() - self.time_last_log) / self.current_accum_target
+            self.train_step_delta = time.perf_counter() - self.time_last_log
 
             if self.if_log_rank():
-                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr)
-
+                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr, interval_tokens)
+            self.fwd_bwd_time = 0.0
+            self.data_time_total = 0.0
             self.total_ntokens_since_last_log = 0
             self.ntokens_since_last_log = 0
             self.samples_since_last_log = 0
@@ -561,6 +582,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info(f"cProfile stats written to {out_path}")
 
     def train(self):
+        #breakpoint()
         data_iterator = self.batch_generator()
 
         optimizer, scheduler = self.create_optimizer()
@@ -568,13 +590,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             paths = os.listdir(self.training_args.output_dir)
             possible_steps = []
             for path in paths:
-                match = re.search(r"(\d+\.?\d*)$", path)
-                try:
-                    if match:
-                        step = match.group(1)
-                    possible_steps.append(int(step))
-                except Exception as e:
-                    pass
+                match = re.search(r"checkpoint-step-(\d+)$", path)
+                if match:
+                    try:
+                        possible_steps.append(int(match.group(1)))
+                    except Exception:
+                        pass
 
             if possible_steps:
                 largest_step = max(possible_steps)
@@ -658,6 +679,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         exit()
 
 if __name__ == "__main__":
+    
     config_manager = ConfigManager(Config)
     args = sys.argv[1:]
     config = config_manager.parse_args(args)

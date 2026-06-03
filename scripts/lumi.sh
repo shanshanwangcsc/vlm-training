@@ -58,7 +58,6 @@ export NCCL_NET_GDR_LEVEL="PHB"
 export FI_CXI_ATS=0
 export FI_CXI_DISABLE_CQ_HUGETLB=1
 export FI_MR_CACHE_MONITOR=userfaultfd
-
 CONFIG_FILE=${1:?Usage: sbatch run.sh <config.toml>}
 
 
