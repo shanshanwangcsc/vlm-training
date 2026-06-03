@@ -38,8 +38,10 @@ def get_wandb_data(run_paths):
 
 # PUT THE RUNS IDS HERE
 run_paths = [
-"shanshan-wang-csc-csc/qwen3-vl_8b/jvldxa7c",
-"shanshan-wang-csc-csc/qwen3-vl_8b/7pfx6v2q"
+
+"shanshan-wang-csc-csc/qwen3-5_9b/lss54t0t",
+"shanshan-wang-csc-csc/qwen3-5_9b/g03gjnma",
+"shanshan-wang-csc-csc/qwen3-5_9b/51lvc8my"
 ]
 
 # Fetch data and sort by GPU count to ensure correct X-axis ordering
@@ -77,7 +79,7 @@ fig, (ax1, ax3) = plt.subplots(2, 1, gridspec_kw={'height_ratios': [3, 1]}, figs
 fig.subplots_adjust(hspace=0.08)
 
 # --- TOP PANEL: Total Throughput ---
-ax1.set_title(r"Weak Scaling Qwen3VL-8B on LUMI")
+ax1.set_title(r"Weak Scaling Qwen3.5-9B on LUMI")
 ax1.set_ylabel(r"Tokens/sec")
 ax1.grid(True, linestyle='--', alpha=0.5, axis='y')
 
@@ -137,5 +139,5 @@ ax3.set_xticks(x_pos)
 ax3.set_xticklabels([f"{g}\n(Seq: {s})" for g, s in zip(gpus, seq_len)])
 
 # Save and show
-plt.savefig("throughput_scaling.pdf", format="pdf", bbox_inches='tight')
-plt.show()
+plt.savefig("qwen_3_5_9b.png")
+#plt.show()
