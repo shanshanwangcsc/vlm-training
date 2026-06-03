@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
-
+import re
 def get_wandb_data(run_paths):
     api = wandb.Api()
     data = []
@@ -38,17 +38,16 @@ def get_wandb_data(run_paths):
 
 # PUT THE RUNS IDS HERE
 run_paths = [
-
-"shanshan-wang-csc-csc/qwen3-5_9b/lss54t0t",
-"shanshan-wang-csc-csc/qwen3-5_9b/g03gjnma",
-"shanshan-wang-csc-csc/qwen3-5_9b/51lvc8my"
+"shanshan-wang-csc-csc/qwen3-vl_2b/waaj7l44",
+"shanshan-wang-csc-csc/qwen3-vl_2b/78jhlzfr",
+"shanshan-wang-csc-csc/qwen3-vl_2b/wc9kyzh2"
 ]
 
 # Fetch data and sort by GPU count to ensure correct X-axis ordering
 df = get_wandb_data(run_paths)
 #breakpoint()
 df = df.sort_values(by="World Size").reset_index(drop=True)
-
+model_name = df["Model"].iloc[0]
 # Enable LaTeX text rendering
 """
 plt.rcParams.update({
@@ -75,11 +74,12 @@ efficiency = (measured_total / optimal_total) * 100
 x_pos = np.arange(len(gpus))
 
 # --- PLOT SETUP ---
-fig, (ax1, ax3) = plt.subplots(2, 1, gridspec_kw={'height_ratios': [3, 1]}, figsize=(8, 6), sharex=True)
+fig, (ax1, ax3) = plt.subplots(2, 1, gridspec_kw={'height_ratios': [3, 1]}, figsize=(10, 6), sharex=True)
 fig.subplots_adjust(hspace=0.08)
 
 # --- TOP PANEL: Total Throughput ---
-ax1.set_title(r"Weak Scaling Qwen3.5-9B on LUMI")
+#ax1.set_title(r"Weak Scaling Qwen3.5-9B on LUMI")
+ax1.set_title(f"Weak Scaling {model_name} on LUMI")
 ax1.set_ylabel(r"Tokens/sec")
 ax1.grid(True, linestyle='--', alpha=0.5, axis='y')
 
@@ -106,16 +106,29 @@ ax1.legend(lines, labels, loc='upper left', framealpha=1.0, edgecolor='black', f
 # --- BOTTOM PANEL: Per GPU Metrics ---
 ax3.set_xlabel(r"Number of GPUs")
 ax3.set_ylabel(r"TFLOPS/s/GPU")
-ax3.set_ylim(0, 60)
+ax3.set_ylim(0, max(tflops_per_gpu) * 1.15)
 ax3.grid(True, linestyle='--', alpha=0.5, axis='y')
+
 
 bars = ax3.bar(x_pos, tflops_per_gpu, width=bar_width, color='#43A047', zorder=2, label=r"TFLOPS/s/GPU")
 
 # Add text labels for TFLOPS
+#for bar in bars:
+#    yval = bar.get_height()
+#    ax3.text(bar.get_x() + bar.get_width()/2, yval - 100, f'{yval:,.2f}', ha='center', va='bottom', fontsize=9)
+
+offset = max(tflops_per_gpu) * 0.02
+
 for bar in bars:
     yval = bar.get_height()
-    ax3.text(bar.get_x() + bar.get_width()/2, yval - 100, f'{yval:,.2f}', ha='center', va='bottom', fontsize=9)
-
+    ax3.text(
+        bar.get_x() + bar.get_width()/2,
+        yval + offset,
+        f'{yval:.2f}',
+        ha='center',
+        va='bottom',
+        fontsize=9
+    )
 # --- NEW: Twin Axis for Tokens/s/GPU in Bottom Panel ---
 ax4 = ax3.twinx()
 ax4.set_ylabel(r"Tokens/s/GPU")
@@ -132,12 +145,17 @@ for x, y in zip(x_pos, tps_per_gpu):
 # Combine legends for the bottom panel
 bottom_lines = [bars, l4]
 bottom_labels = [l.get_label() for l in bottom_lines]
-ax3.legend(bottom_lines, bottom_labels, loc='upper right', framealpha=1.0, edgecolor='black', fancybox=False, fontsize=9)
+ax3.legend(bottom_lines, bottom_labels, loc='upper right',bbox_to_anchor=(0.85, 1.0), framealpha=1.0, edgecolor='black', fancybox=False, fontsize=6)
 
+
+plt.subplots_adjust(right=0.78)
 # Set categorical ticks and labels
 ax3.set_xticks(x_pos)
 ax3.set_xticklabels([f"{g}\n(Seq: {s})" for g, s in zip(gpus, seq_len)])
 
 # Save and show
-plt.savefig("qwen_3_5_9b.png")
+#plt.savefig("throughput_scaling.pdf", format="pdf", bbox_inches='tight')
+model_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", model_name)
+filename = f"{model_name}.png"
+plt.savefig(filename,dpi=300,pad_inches=0.2)
 #plt.show()
