@@ -9,7 +9,8 @@
 #SBATCH --mem=480G
 #SBATCH --output=logs/%j/log_%x.out
 #SBATCH --error=logs/%j/rank_%t.err
-##SBATCH --exclude=nid005002,nid005019
+#SBATCH --exclude=nid005002,nid005019,nid005895,nid005678
+
 
 # ---------- Modules ----------
 module --force purge
@@ -58,6 +59,10 @@ export NCCL_NET_GDR_LEVEL="PHB"
 export FI_CXI_ATS=0
 export FI_CXI_DISABLE_CQ_HUGETLB=1
 export FI_MR_CACHE_MONITOR=userfaultfd
+export OMP_NUM_THREADS=1
+
+
+
 CONFIG_FILE=${1:?Usage: sbatch run.sh <config.toml>}
 
 

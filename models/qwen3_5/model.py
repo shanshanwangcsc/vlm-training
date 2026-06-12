@@ -7,12 +7,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.varlen import varlen_attn
 
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk_gated_delta_rule
-from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated
-from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
+try:
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk_gated_delta_rule
+    from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated
+    from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
+except Exception:
+    pass
 
 from models.qwen3_5.config import (
-    Qwen3VLConfig, Qwen3_5TextConfig, Qwen3_5VisionConfig
+    Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 )
 from models.qwen3_5.utils import (
     _dtensor_unwrap,
@@ -25,6 +28,65 @@ from models.qwen3_5.utils import (
     apply_rope_vision,
     load_safetensors_into,
 )
+try:
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
+    HAS_FLASH = True
+except Exception:
+    HAS_FLASH = False
+
+def dispatch_varlen_attention(
+    q,
+    k,
+    v,
+    cu_seq_q,
+    cu_seq_k,
+    max_q,
+    max_k,
+    is_causal=False,
+    **kwargs,
+):
+    # This model assumes q/k/v use the same packed sequence layout.
+    assert torch.equal(cu_seq_q, cu_seq_k)
+    assert max_q == max_k
+
+    is_dtensor = hasattr(q, "to_local")
+
+    if is_dtensor:
+        mesh = q.device_mesh
+        placements = q.placements
+
+        q_local = q.to_local()
+        k_local = k.to_local()
+        v_local = v.to_local()
+    else:
+        q_local, k_local, v_local = q, k, v
+
+    if not HAS_FLASH:
+        raise RuntimeError(
+            "flash_attn_varlen_func is unavailable. "
+            "torch.nn.attention.varlen is not compatible with this model."
+        )
+
+    out = flash_attn_varlen_func(
+        q_local,
+        k_local,
+        v_local,
+        cu_seqlens_q=cu_seq_q,
+        cu_seqlens_k=cu_seq_k,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        causal=is_causal,
+    )
+
+    if is_dtensor:
+        from torch.distributed.tensor import DTensor
+        out = DTensor.from_local(
+            out,
+            device_mesh=mesh,
+            placements=placements,
+        )
+
+    return out
 
 class RMSNormGated(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -32,20 +94,23 @@ class RMSNormGated(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
+    @staticmethod
+    @torch.compiler.disable
+    def _run_fla_rms_norm_gated(hs, gate, weight, eps):
+        return _fla_rms_norm_gated(
+            hs, gate, weight, None, "swish",
+            residual=None, eps=eps, prenorm=False, residual_in_fp32=False,
+        )
+
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         D = orig_shape[-1]
         (hs_local, gate_local), wrap = _dtensor_unwrap(hidden_states, gate)
-        out = _fla_rms_norm_gated(
+        out = RMSNormGated._run_fla_rms_norm_gated(
             hs_local.reshape(-1, D),
             gate_local.reshape(-1, D),
             _local(self.weight),
-            None,
-            "swish",
-            residual=None,
-            eps=self.eps,
-            prenorm=False,
-            residual_in_fp32=False,
+            self.eps,
         )
         return _dtensor_rewrap(out.reshape(orig_shape), wrap)
 
@@ -60,14 +125,10 @@ class OffsetRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x = x.float()
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-
-        # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
+        # (1 + weight) offset matches HF Qwen3_5 vs plain RMSNorm.
+        # F.rms_norm handles the fp32 upcast internally and lets inductor fuse.
         # See https://github.com/huggingface/transformers/pull/29402
-        return ((1.0 + self.weight.float()) * x).to(input_dtype)
+        return F.rms_norm(x, self.weight.shape, 1.0 + self.weight, self.eps)
 
 class SelfAttention(nn.Module):
     def __init__(self, cfg: Qwen3_5TextConfig):
@@ -85,7 +146,27 @@ class SelfAttention(nn.Module):
         self.q_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
 
-    @torch.compiler.disable(recursive=True)
+    @staticmethod
+    @torch.compiler.disable
+    def _run_varlen_attn(q, k, v, cu_seqlens, max_seqlen):
+        '''
+        return varlen_attn(
+            q, k, v,
+            cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
+            max_q=max_seqlen, max_k=max_seqlen,
+            #window_size=(-1, 0),  # causal
+            is_causal=True
+        )'''
+        return dispatch_varlen_attention(
+            q, k, v,
+            cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
+            max_q=max_seqlen, max_k=max_seqlen,
+            #window_size=(-1, 0),  # causal
+            is_causal=True
+        )
+
+        
+
     def forward(
         self,
         x: torch.Tensor,
@@ -94,10 +175,9 @@ class SelfAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        assert x.dim() == 3 and x.shape[0] == 1, f"expected (1, total, hidden), got {tuple(x.shape)}"
         total = x.shape[1]
-
         input_shape = x.shape[:-1]
+
         q, gate = torch.chunk(self.q_proj(x).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
         gate = gate.reshape(*input_shape, -1)
 
@@ -109,23 +189,24 @@ class SelfAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
+        # Unwrap DTensors before RoPE so apply_rope receives plain tensors and
+        # avoids the DTensor.from_local path that can't run in compiled code.
+        (q, k, v), wrap = _dtensor_unwrap(q, k, v)
         q, k = apply_rope(q, k, cos, sin)
 
-        q = q.transpose(1, 2).reshape(total, self.num_heads, self.head_dim).contiguous()
-        k = k.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
-        v = v.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
+        #q = q.transpose(1, 2).reshape(total, self.num_heads, self.head_dim).contiguous()
+        #k = k.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
+        #v = v.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
+        q = q.transpose(1, 2).squeeze(0).contiguous()   # (total, local_heads, head_dim)
+        k = k.transpose(1, 2).squeeze(0).contiguous()
+        v = v.transpose(1, 2).squeeze(0).contiguous()
 
-        (q, k, v), wrap = _dtensor_unwrap(q, k, v)
-        out = varlen_attn(
-            q, k, v,
-            cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
-            max_q=max_seqlen, max_k=max_seqlen,
-            #window_size=(-1, 0),  # causal
-            is_causal=True,
-        )
+        out = SelfAttention._run_varlen_attn(q, k, v, cu_seqlens, max_seqlen)
         out = _dtensor_rewrap(out, wrap)
 
-        out = out.reshape(1, total, self.num_heads * self.head_dim)
+        #out = out.reshape(1, total, self.num_heads * self.head_dim)
+        out = out.reshape(1, total, -1)   # instead of self.num_heads * self.head_dim
+
         out = out * torch.sigmoid(gate)
         return self.o_proj(out)
 
@@ -164,7 +245,21 @@ class GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(cfg.linear_value_head_dim, eps=cfg.rms_norm_eps)
         self.out_proj = nn.Linear(value_dim, dim, bias=False)
 
-    @torch.compiler.disable(recursive=True)
+    @staticmethod
+    @torch.compiler.disable
+    def _run_conv1d(x, weight, bias, seq_idx):
+        return _causal_conv1d_fn(x=x, weight=weight, bias=bias, seq_idx=seq_idx, activation="silu")
+
+    @staticmethod
+    @torch.compiler.disable
+    def _run_gated_delta_rule(q, k, v, g, beta, cu_seqlens):
+        output, _ = _fla_chunk_gated_delta_rule(
+            q, k, v, g, beta,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens.to(torch.int64),
+        )
+        return output
+
     def forward(self, x: torch.Tensor, cu_seqlens, **kwargs) -> torch.Tensor:
         B, L, _ = x.shape
         qkv = self.in_proj_qkv(x)  # (B, L, conv_dim) — channel-last in memory
@@ -179,15 +274,12 @@ class GatedDeltaNet(nn.Module):
             torch.arange(L, device=qkv.device), cu_seqlens[1:-1], right=True
         ).to(torch.int32).unsqueeze(0).expand(B, -1).contiguous()
 
-        # Fused causal-conv1d + SiLU. Input is (B, C, L) with channel-last
-        # strides (stride(1) == 1), which is what the kernel expects when
-        # seq_idx is provided. Triton kernel → needs local tensors.
-        mixed_qkv = _causal_conv1d_fn(
-            x=qkv.transpose(1, 2),
-            weight=_local(self.conv1d.weight).squeeze(1),
-            bias=_local(self.conv1d.bias),
-            seq_idx=seq_idx,
-            activation="silu",
+        # Fused causal-conv1d + SiLU. Triton kernel → isolated behind disable.
+        mixed_qkv = GatedDeltaNet._run_conv1d(
+            qkv.transpose(1, 2),
+            _local(self.conv1d.weight).squeeze(1),
+            _local(self.conv1d.bias),
+            seq_idx,
         ).transpose(1, 2)  # (B, L, conv_dim)
 
         # Split into q, k, v and reshape to (B, L, H, D)
@@ -205,16 +297,12 @@ class GatedDeltaNet(nn.Module):
             k = k.repeat_interleave(repeat, dim=2)
 
         # Log-decay (g) and update weight (beta). A_log/dt_bias may be Replicate
-        # DTensors under TP — work in local-tensor space.
+        # DTensors under TP — _local() is now compile-friendly (no-op for plain tensors).
         g = -torch.exp(_local(self.A_log).float()) * F.softplus(a.float() + _local(self.dt_bias))
         beta = torch.sigmoid(b)
 
-        # Gated delta rule in (B, L, H, D) layout. Triton kernel → local only.
-        output, _ = _fla_chunk_gated_delta_rule(
-            q, k, v, g, beta,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens.to(torch.int64),
-        )
+        # Gated delta rule in (B, L, H, D) layout. Triton kernel → isolated behind disable.
+        output = GatedDeltaNet._run_gated_delta_rule(q, k, v, g, beta, cu_seqlens)
 
         # Gated norm (Triton inside RMSNormGated, already DTensor-safe).
         z = z.view(B, L, self.n_value_heads, self.value_head_dim)
@@ -372,13 +460,22 @@ class VisionAttention(nn.Module):
         v = v.contiguous()
 
         (q, k, v), wrap = _dtensor_unwrap(q, k, v)
+        '''
         out = varlen_attn(
             q, k, v,
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             #window_size=(-1, -1),  # non-causal
-            is_causal=False,
+            is_causal=False
+        )'''
+        out = dispatch_varlen_attention(
+            q, k, v,
+            cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
+            max_q=max_seqlen, max_k=max_seqlen,
+            #window_size=(-1, -1),  # non-causal
+            is_causal=False
         )
+        
         out = _dtensor_rewrap(out, wrap)
         return self.proj(out.reshape(S, self.dim))
 
@@ -468,8 +565,6 @@ class VisionModel(nn.Module):
         return emb.flatten(1)  # (total, dim)
 
     def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        assert grid_thw.dim() == 2 and grid_thw.size(1) == 3, \
-            f"Expected grid_thw shape (N,3), got {grid_thw.shape}"
         grid_list = grid_thw.tolist()
         grid_ts = [r[0] for r in grid_list]
         grid_hs = [r[1] for r in grid_list]
@@ -556,13 +651,13 @@ class Qwen3_5Inner(nn.Module):
     """HF name: `model`. Groups `language_model` and `visual`.
     This is only used to match the state keys. """
 
-    def __init__(self, cfg: Qwen3VLConfig):
+    def __init__(self, cfg: Qwen3_5Config):
         super().__init__()
         self.language_model = LanguageModel(cfg.text)
         self.visual = VisionModel(cfg.vision)
 
 class Qwen3_5ForCausalLM(nn.Module):
-    def __init__(self, cfg: Qwen3VLConfig, **kwargs):
+    def __init__(self, cfg: Qwen3_5Config, **kwargs):
         super().__init__()
         self.cfg = cfg
         self.model = Qwen3_5Inner(cfg)
@@ -683,10 +778,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         (same tensor consumed by `torch.nn.attention.varlen.varlen_attn`).
         If `attention_mask` is None, the whole row is treated as one sample.
         """
-        if image_grid_thw is not None and image_grid_thw.ndim == 1:
-            image_grid_thw = image_grid_thw.unsqueeze(0)
-        if video_grid_thw is not None and video_grid_thw.ndim == 1:
-            video_grid_thw = video_grid_thw.unsqueeze(0)
         assert (input_ids is None) ^ (inputs_embeds is None)
         if input_ids is not None and input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
@@ -802,7 +893,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         load_vision: bool = True,
     ) -> "Qwen3_5ForCausalLM":
         snapshot_dir = Path(snapshot_dir)
-        cfg = Qwen3VLConfig.from_json(snapshot_dir / "config.json")
+        cfg = Qwen3_5Config.from_json(snapshot_dir / "config.json")
         if dtype is None:
             dtype = {
                 "bfloat16": torch.bfloat16,
@@ -847,5 +938,4 @@ class Qwen3_5ForCausalLM(nn.Module):
             ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
         )
         model.text_inv_freq = text_inv
-        return model
-
+        return model, cfg

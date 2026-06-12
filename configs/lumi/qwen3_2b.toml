@@ -1,9 +1,11 @@
 [model]
 model_name = "Qwen/Qwen3-VL-2B-Instruct"
 model_impl = "native"
+
 train_llm = true
-train_mlp = true
 train_vit = false
+train_mlp = true
+
 [wandb]
 run_name = "qwen3-vl_2b_lumi"
 project_name = "qwen3-vl_2b"
@@ -12,24 +14,32 @@ entity_name = "shanshan-wang-csc-csc"
 [training]
 model_dir = "cache/qwen3_2b"
 output_dir = "checkpoints"
+text_model_dir = "cache/qwen3_1_7b"
+load_text_model = false
 
-save_steps = 100
-total_steps = 100
+vision_model_dir = "cache/siglip2_large"
+load_vision_model = false
+
+scheduler_type = "cosine"
 warmup_steps = 20
+min_lr_ratio = 0.1
+save_steps = 100
 
-random_init = false
-resume_checkpoint = false
+total_steps = 100
+lr_llm = 0.00002
+lr_mlp = 0.0001
+lr_vit = 0.00005
 
-tp_size = 1
 data_parallel = 'ddp'
+tp_size = 1
 
+tpi_multiplier = 3
 compile = false
-ac_mode = "full"
-
 
 [data]
 data_path = "/scratch/project_462001202/shanshan/synth-data-bench-training/data/cap_pretrain"
-seq_len = 8192
+seq_len = 4096
+#seq_len = 8192
 
 packing_buffer_size = 1000
 max_samples_per_sequence=400

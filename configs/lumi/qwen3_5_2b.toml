@@ -1,47 +1,46 @@
 [model]
 model_name = "Qwen/Qwen3.5-2B"
-
 model_impl = "native"
 
+train_vit = false
 train_llm = true
 train_mlp = true
-train_vit = false
 
 [wandb]
 run_name = "qwen3-5_2b_lumi"
 project_name = "qwen3-5_2b"
 entity_name = "shanshan-wang-csc-csc"
 
+
 [training]
 model_dir = "cache/qwen3_5_2b"
 output_dir = "checkpoints"
 
-tpi_multiplier = 1.0
 save_steps = 100
+total_steps = 100
+random_init = true
 
 scheduler_type = "cosine"
-total_steps = 100
-warmup_steps = 10
-#wsd_decay_ratio = 0.1
-min_lr_ratio = 0.1
 
-lr_llm = 0.00002
-lr_mlp = 0.0001
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
 
-data_parallel = 'ddp'
 tp_size = 1
-
-resume_checkpoint = false
-random_init = true
+data_parallel = 'ddp'
 
 compile = false
 
-[data]
-data_path = "/scratch/project_462001202/shanshan/synth-data-bench-training/data/cap_pretrain"
+ac_mode = 'full'
 
+tpi_multiplier = 1
+
+[data]
+
+data_path = "/scratch/project_462001202/shanshan/synth-data-bench-training/data/cap_pretrain"
 seq_len = 4096
+
 packing_buffer_size = 1000
-max_samples_per_sequence = 400
+max_samples_per_sequence=400
 shuffle_buffer_size=4000
 batch_size = 0
-

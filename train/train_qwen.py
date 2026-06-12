@@ -48,14 +48,16 @@ from train.utils import (
     dist_mean,
     dist_max,
     dist_sum,
-
-    get_dense_model_nparams_and_flops,
+    dist_all_gather,
 
     select_text_model,
+    select_vision_model,
     select_model_class,
     set_model,
     load_text_model,
+    load_vision_model,
 )
+from train.flops_estimation import get_dense_model_nparams_and_flops
 
 torch._logging.set_logs(graph_code=True)
 torch._inductor.config.fx_graph_cache = True
@@ -68,7 +70,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     @record
     def __init__(self, cfg: Config):
-        
         self.model_args = cfg.model
         self.training_args = cfg.training
         self.data_args = cfg.data
@@ -126,20 +127,36 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             raise NotImplementedError(f"model not supported: {self.model_args.model_name}")
 
-        self.model = select_model_class(self.model_type, self.model_args, self.training_args)
+        self.model, self.cfg_model = select_model_class(self.model_type, self.model_args, self.training_args)
 
         # we calculate the flops per token used to get the MFU number
         num_params, self.flops_per_token = get_dense_model_nparams_and_flops(
-            self.model_args.model_name,
+            self.model_type,
+            self.cfg_model,
             self.model,
             seq_len=int(self.data_args.seq_len),
         )
 
+        self.flops_per_token = self.flops_per_token / self.training_args.tp_size
+
+        # peak bf16 TFLOPs per GPU, used for the MFU number
+        # SXM H100/GH200 (MN5): 989.4 ; L40S: 362
+        #self.peak_tflops_per_gpu = 989.4
+        self.peak_tflops_per_gpu = 191.5
+
         logger.info(f"Number params: {num_params}")
+        logger.info(f"flops_per_token: {self.flops_per_token}")
+        
 
         if self.training_args.load_text_model:
             self.text_model = select_text_model(self.training_args)
             self.model = load_text_model(self.model, self.text_model)
+            del self.text_model
+
+        if self.training_args.load_vision_model:
+            self.vision_model = select_vision_model(self.training_args)
+            self.model = load_vision_model(self.model, self.vision_model)
+            del self.vision_model
 
         # MOVE TO cuda:{self.local_rank}
         self.model.to(self.device)
@@ -225,13 +242,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         ds = get_train_dataset(
             self.data_args.data_path,
             batch_size=1,
+            repeat=True,
             shuffle_buffer_size=self.data_args.shuffle_buffer_size,
             max_samples_per_sequence=self.data_args.max_samples_per_sequence,
             task_encoder=task_encoder,
             worker_config=worker_config,
             **extra_ds_kwargs,
         )
-        #breakpoint()
 
         self.data_loader = get_loader(ds)
 
@@ -239,8 +256,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.global_step = 0
         self.micro_step = 0
-        self.fwd_bwd_time = 0.0
-        self.data_time_total = 0.0
 
         self.tokens_seen = 0
         self.tokens_seen_assistant = 0
@@ -250,7 +265,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.samples_since_last_log = 0
 
         self.time_last_log = time.perf_counter()
-        
         self.color = Color()
 
     def rank(self):
@@ -261,7 +275,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     def create_optimizer(self):
         if self.optimizer is not None:
-            return self.optimizer, self.scheduler
+            return self.optimizer
 
         lr_mlp = self.training_args.lr_mlp
         lr_vit = self.training_args.lr_vit
@@ -373,7 +387,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         except Exception as e:
             logger.info(f"rank: {self.rank()}")
             logger.info(f"exception during checkpointing: {e}")
-            raise
         else:
             self.tokens_seen = state_dict['tokens_seen']
             self.tokens_seen_assistant = state_dict['tokens_seen_assistant']
@@ -395,7 +408,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         while True:
             data_start_time = time.perf_counter()
-            batch = next(data_iter)
+            try: 
+                batch = next(data_iter)
+            except StopIteration:
+                self.end_run()
 
             if batch['cu_seqlens'].ndim > 1:
                 batch['cu_seqlens'].squeeze_()
@@ -421,49 +437,66 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.tokens_seen_assistant += ntokens_batch_assistant
             self.tokens_seen += ntokens_batch
             self.ntokens_since_last_log += ntokens_batch
-            #self.total_ntokens_since_last_log += self.data_args.seq_len
-            self.total_ntokens_since_last_log += ntokens_batch
+            self.total_ntokens_since_last_log += self.data_args.seq_len
             self.samples_since_last_log += batch_samples
 
-            self.data_time_total += time.perf_counter() - data_start_time
+            self.data_time_delta = time.perf_counter() - data_start_time
 
             yield batch
 
-    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr,interval_tokens):
+    def _gather_perf(self, time_delta):
+        tps = self.ntokens_since_last_log / time_delta
+        flops_per_sec = (self.flops_per_token * self.total_ntokens_since_last_log) / time_delta
+        tflops_per_sec = flops_per_sec / 1e12
+        mfu = (flops_per_sec / (self.peak_tflops_per_gpu * 1e12)) * 100
+        peak_mem_gib = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
 
-        time_delta = self.train_step_delta
+        local = torch.tensor(
+            [tps, self.train_step_delta, self.fwd_bwd_time, tflops_per_sec, mfu, peak_mem_gib],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        return dist_all_gather(local, torch.distributed.group.WORLD)
 
-        dp_size = self.dp_group.size()
-        tp_size = max(1, self.training_args.tp_size)
+    # column order produced by `_gather_perf`; True == higher is better
+    _PERF_METRIC_NAMES = ("tps", "step_time", "fwd_bwd_time", "tflops", "mfu", "mem_gib")
+    _PERF_HIGHER_IS_BETTER = (True, False, False, True, True, False)
 
-        # aggregate throughput across all DP workers
-        global_tps = interval_tokens / time_delta
+    def _topk_metrics(self, gathered):
+        """Build the perf_topk/* dict: K slowest and K fastest ranks per metric."""
+        metrics = {}
+        k = min(self.wandb_args.top_k, gathered.shape[0])
+        for j, name in enumerate(self._PERF_METRIC_NAMES):
+            col = gathered[:, j]
+            higher_better = self._PERF_HIGHER_IS_BETTER[j]
+            worst_v, worst_i = torch.topk(col, k, largest=not higher_better)
+            best_v, best_i = torch.topk(col, k, largest=higher_better)
+            for r in range(k):
+                metrics[f"perf_topk/{name}_slow_{r}"] = worst_v[r].item()
+                metrics[f"perf_topk/{name}_slow_{r}_rank"] = int(worst_i[r].item())
+                metrics[f"perf_topk/{name}_fast_{r}"] = best_v[r].item()
+                metrics[f"perf_topk/{name}_fast_{r}_rank"] = int(best_i[r].item())
+        return metrics
 
-        # throughput per GPU/GCD
-        tps_per_gcd = global_tps / dp_size
+    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr, time_delta, gathered=None):
+        tps = self.ntokens_since_last_log / time_delta
 
-        # FLOPs
-        global_flops_per_sec = (self.flops_per_token * global_tps)
+        step_flops = self.flops_per_token * self.total_ntokens_since_last_log
+        flops_per_sec = step_flops / time_delta
+        tflops_per_sec = flops_per_sec / 1e12
 
-        per_gpu_flops_per_sec = (global_flops_per_sec /(dp_size * tp_size))
-
-        tflops_per_gpu = per_gpu_flops_per_sec / 1e12
-
-        peak_tflops_per_gpu = 191.5
-        mfu = 100.0 * tflops_per_gpu / peak_tflops_per_gpu
+        mfu = (flops_per_sec / (self.peak_tflops_per_gpu * 1e12)) * 100
 
         color = self.color
 
-
-        data_time_pct = (self.data_time_total / time_delta) * 100
+        data_time_pct = (self.data_time_delta / time_delta) * 100
 
         logger.info(
-            f"{color.red}step {self.global_step} "
+            f"{color.red}{self.global_step}{color.reset} - "
                 f"{color.green}loss {avg_loss:.4f} "
-                f"{color.blue}global_tps {global_tps:.2f} "
-                f"tps_per_gcd {tps_per_gcd:.0f} "
+                f"{color.blue}tps {tps:.2f} "
                 f"{color.magenta}mfu {mfu:.1f}% "
-                f"{color.yellow}tflops {tflops_per_gpu:.1f} "
+                f"{color.cyan}tflops {tflops_per_sec:.1f} "
                 f"{color.reset}"
                 f"time {self.train_step_delta:.3f}s "
                 f"fwd {self.fwd_bwd_time:.3f}s "
@@ -482,14 +515,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "train/batch_efficiency": self.batch_efficiency,
 
             # performance related
-            "perf/tokens_per_second": global_tps,
-            "perf/tps_per_gcd": tps_per_gcd,
+            "perf/tokens_per_second": tps,
             "perf/data_time_pct": data_time_pct,
             "perf/step_time": self.train_step_delta,
             "perf/fwd_bwd_time": self.fwd_bwd_time,
-            "perf/tflops_per_gpu": tflops_per_gpu,
+            "perf/tflops_per_second": tflops_per_sec,
             "perf/mfu": mfu,
         }
+
+        if gathered is not None:
+            log_metrics.update(self._topk_metrics(gathered))
 
         wandb.log(log_metrics, step=self.global_step)
 
@@ -500,25 +535,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_count = 0
 
     def train_step(self, data_iterator, optimizer):
-        
         batch = next(data_iterator)
-        #breakpoint()
+
         s_model = time.perf_counter()
-        
         with record_function("forward_pass"):
             with torch.autocast('cuda', torch.bfloat16):
                 outputs = self.model(
                     **batch
                 )
                 loss = outputs.loss
-                #breakpoint()
-        
+
         with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target
             with torch.autocast('cuda', torch.bfloat16):
                 scaled_loss.backward()
-        
-        self.fwd_bwd_time += time.perf_counter() - s_model
+
+        self.fwd_bwd_time = time.perf_counter() - s_model
 
         self.current_accum_count += 1
 
@@ -526,12 +558,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with record_function("optimizer_step"):
                 optimizer.step()
                 optimizer.zero_grad()
-            
+
             lr = optimizer.param_groups[0]['lr']
 
             self.global_step += 1
 
-            avg_loss, max_loss, global_tokens, global_assistant, global_samples, interval_tokens= (
+            avg_loss, max_loss, global_tokens, global_assistant, global_samples = (
                 dist_mean(loss, self.dp_group),
                 dist_max(loss, self.dp_group),
                 dist_sum(
@@ -549,19 +581,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 dist_sum(
                     torch.tensor(self.samples_since_last_log, dtype=torch.int32, device=self.device),
                     self.dp_group,
-                ),
-                dist_sum(torch.tensor(self.total_ntokens_since_last_log,dtype=torch.int64,device=self.device,),self.dp_group,)
+                )
             )
 
-            self.train_step_delta = time.perf_counter() - self.time_last_log
+            time_delta = time.perf_counter() - self.time_last_log
+            self.train_step_delta = time_delta / self.current_accum_target
+
+            gathered = None
+            if self.wandb_args.log_topk:
+                gathered = self._gather_perf(time_delta)
 
             if self.if_log_rank():
-                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr, interval_tokens)
-            self.fwd_bwd_time = 0.0
-            self.data_time_total = 0.0
+                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr, time_delta, gathered)
+
             self.total_ntokens_since_last_log = 0
             self.ntokens_since_last_log = 0
             self.samples_since_last_log = 0
+            torch.cuda.reset_peak_memory_stats(self.device)
             self.time_last_log = time.perf_counter()
 
             self.current_accum_count = 0
@@ -582,7 +618,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info(f"cProfile stats written to {out_path}")
 
     def train(self):
-        #breakpoint()
         data_iterator = self.batch_generator()
 
         optimizer, scheduler = self.create_optimizer()
@@ -590,12 +625,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             paths = os.listdir(self.training_args.output_dir)
             possible_steps = []
             for path in paths:
-                match = re.search(r"checkpoint-step-(\d+)$", path)
-                if match:
-                    try:
-                        possible_steps.append(int(match.group(1)))
-                    except Exception:
-                        pass
+                match = re.search(r"(\d+\.?\d*)$", path)
+                try:
+                    if match:
+                        step = match.group(1)
+                    possible_steps.append(int(step))
+                except Exception as e:
+                    pass
 
             if possible_steps:
                 largest_step = max(possible_steps)
@@ -622,7 +658,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if self.debug_mode:
             # wait=30 skips the torch.compile warmup steps; active=5 records 5 full steps
-            prof_schedule = schedule(wait=30, warmup=2, active=100, repeat=1)
+            prof_schedule = schedule(wait=10, warmup=2, active=2, repeat=1)
             prof_ctx = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 schedule=prof_schedule,
@@ -641,34 +677,31 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         _cprof_active = False
 
         with prof_ctx as prof:
-            try:
-                while self.global_step < self.training_args.total_steps:
-                    self.micro_step += 1
+            while self.global_step < self.training_args.total_steps:
+                self.micro_step += 1
 
-                    if self.debug_mode and not _cprof_active and self.global_step >= _CPROF_START:
-                        _cprof.enable()
-                        _cprof_active = True
+                if self.debug_mode and not _cprof_active and self.global_step >= _CPROF_START:
+                    _cprof.enable()
+                    _cprof_active = True
 
-                    optimizer_updated = self.train_step(data_iterator, optimizer)
-                    if prof is not None:
-                        prof.step()
+                optimizer_updated = self.train_step(data_iterator, optimizer)
+                if prof is not None:
+                    prof.step()
 
-                    if optimizer_updated:
-                        scheduler.step()
+                if optimizer_updated:
+                    scheduler.step()
 
-                        if _cprof_active and self.global_step >= _CPROF_STOP:
-                            _cprof.disable()
-                            _cprof_active = False
-                            self._dump_cprofile(_cprof)
+                    if _cprof_active and self.global_step >= _CPROF_STOP:
+                        _cprof.disable()
+                        _cprof_active = False
+                        self._dump_cprofile(_cprof)
 
-                        if self.may_save() and self.global_step < self.training_args.total_steps:
-                            self.save_checkpoint()
+                    if self.may_save() and self.global_step < self.training_args.total_steps:
+                        self.save_checkpoint()
 
-            except StopIteration as e:
-                if self.if_log_rank():
-                    logger.info(f"data iterator exhausted at step {self.global_step}: {e}")
-
+    def end_run(self):
         if self.if_log_rank():
+            logger.info(f"data iterator exhausted at step {self.global_step}")
             logger.info(f"tokens seen: {self.tokens_seen}")
             logger.info(f"assistant tokens seen: {self.tokens_seen_assistant}")
             logger.info(f"Training completed at step {self.global_step}. Saving final checkpoint...")
@@ -679,7 +712,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         exit()
 
 if __name__ == "__main__":
-    
     config_manager = ConfigManager(Config)
     args = sys.argv[1:]
     config = config_manager.parse_args(args)

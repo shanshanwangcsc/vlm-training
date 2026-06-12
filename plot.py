@@ -25,9 +25,9 @@ def get_wandb_data(run_paths):
             #breakpoint()
 
             # Calculate averages from history
-            history = run.history(keys=["perf/tps_per_gcd", "perf/tflops_per_gpu", "perf/mfu"])
-            row["Avg Tokens/s"] = history["perf/tps_per_gcd"].mean()
-            row["TFLOPS/s"] = history["perf/tflops_per_gpu"].mean()
+            history = run.history(keys=["perf/tokens_per_second", "perf/tflops_per_second", "perf/mfu"])
+            row["Avg Tokens/s"] = history["perf/tokens_per_second"].mean()
+            row["TFLOPS/s"] = history["perf/tflops_per_second"].mean()
             row["MFU"] = history["perf/mfu"].mean()
             #breakpoint()
             data.append(row)
@@ -38,9 +38,9 @@ def get_wandb_data(run_paths):
 
 # PUT THE RUNS IDS HERE
 run_paths = [
-"shanshan-wang-csc-csc/qwen3-vl_2b/waaj7l44",
-"shanshan-wang-csc-csc/qwen3-vl_2b/78jhlzfr",
-"shanshan-wang-csc-csc/qwen3-vl_2b/wc9kyzh2"
+"shanshan-wang-csc-csc/qwen3-vl_8b/27axawdr",
+"shanshan-wang-csc-csc/qwen3-vl_8b/aaxkvcbt",
+"shanshan-wang-csc-csc/qwen3-vl_8b/9zmjxjau"
 ]
 
 # Fetch data and sort by GPU count to ensure correct X-axis ordering

@@ -1,39 +1,33 @@
 [model]
 model_name = "Qwen/Qwen3-VL-8B-Instruct"
 model_impl = "native"
-
 train_llm = true
+train_vit = false
 train_mlp = true
-train_vit = true
-
 [wandb]
 run_name = "qwen3-vl_8b_lumi"
 project_name = "qwen3-vl_8b"
 entity_name = "shanshan-wang-csc-csc"
 
-
 [training]
 model_dir = "cache/qwen3_8b"
 output_dir = "checkpoints"
+tpi_multiplier = 1.0
 
 save_steps = 100
 total_steps = 100
-warmup_steps = 20
-
 random_init = false
-resume_checkpoint = false
 
 tp_size = 2
 data_parallel = 'fsdp'
-tpi_multiplier = 1.0
 
 compile = false
-ac_mode = "full"
+
 [data]
 data_path = "/scratch/project_462001202/shanshan/synth-data-bench-training/data/cap_pretrain"
-
 seq_len = 4096
+
 packing_buffer_size = 1000
-max_samples_per_sequence = 400
+max_samples_per_sequence=400
 shuffle_buffer_size=4000
 batch_size = 0

@@ -1,4 +1,5 @@
 from megatron.energon import Batch, TaskEncoder, stateless, InterleavedSample, Cooker, CrudeSample, basic_sample_keys, SkipSample
+from megatron.energon.flavors.webdataset.sample_decoder import SampleDecoder
 from dataclasses import dataclass
 
 from megatron.energon.edataclass import edataclass
@@ -6,6 +7,7 @@ from megatron.energon.epathlib.epath import EPath
 from megatron.energon.flavors.base_dataset import Sample
 
 import torch
+import random
 import numpy as np
 
 @dataclass
@@ -94,6 +96,27 @@ class EnergonSample(Sample):
     messages: list
 
 @stateless
+def cooker_llava_recap(sample: dict) -> EnergonSample:
+
+    caption = sample['json']['conversations'][1]['value']
+    messages = [
+        {'role': 'user', 'content': [
+            {"type": "image"}
+        ]},
+        {'role': 'assistant', 'content': [
+            {"type": "text", "text": caption}
+        ]},
+    ]
+
+    image = sample['jpg']
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=image,
+        messages=messages,
+    )
+
+@stateless
 def cooker_llava_imagenet(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
     messages = [
         {'role': 'user', 'content': [
@@ -114,6 +137,47 @@ def cooker_llava_imagenet(sample: dict, add_system_prompt: bool = True) -> Energ
         image=image,
         messages=messages,
     )
+
+@stateless
+def cooker_onevision_instruct(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    role_map = {'human': 'user', 'gpt': 'assistant', 'user': 'user', 'assistant': 'assistant'}
+    
+    messages = []
+    
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+        
+    image_added = False
+    
+    for turn in sample['json']['conversations']:
+        raw_role = turn.get('from', turn.get('role', 'user'))
+        role = role_map.get(str(raw_role).lower(), 'user')
+        
+        text_val = turn.get('value', turn.get('content', ''))
+        
+        content = []
+        
+        if "<image>" in text_val or (role == 'user' and not image_added):
+            content.append({"type": "image"})
+            text_val = text_val.replace("<image>", "").strip()
+            image_added = True
+            
+        if text_val:
+            content.append({"type": "text", "text": text_val})
+            
+        if not content:
+            content.append({"type": "text", "text": ""})
+            
+        messages.append({"role": role, "content": content})
+    
+    image = sample['jpg']
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=image,
+        messages=messages,
+    )
+
 
 @stateless
 def cooker_captioning(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
@@ -175,6 +239,13 @@ class SingleBatchEncoder(TaskEncoder):
     - CrudeWebdataset Energon dataset as input
     - The token for "assistant" has to be a single token. This is the case for the Qwen3-VL and Qwen3.5 tokenizers.
     """
+    # Decode images as PIL (uint8 [0,255]). The energon default decoder ("torchrgb")
+    # returns float [0,1] tensors, which the HF processor then re-rescales (do_rescale
+    # ÷255) + normalizes, collapsing pixels to a near-constant ~-0.99 blank image -> the
+    # model trains on destroyed images. PIL feeds the processor what it expects.
+    # See utils/diff_image_preprocessing.py.
+    decoder = SampleDecoder(image_decode="pil")
+
     def __init__(self, processor, max_seq_len):
         super().__init__()
         self.processor = processor
@@ -193,11 +264,11 @@ class SingleBatchEncoder(TaskEncoder):
     # transform the RAW data, tokenize a single sample
     def encode_sample(self, sample: InterleavedSample) -> EncodedSample:
         text = self.processor.apply_chat_template(
-            conversation=sample.messages,
+            conversation=sample.sequence[1],
             tokenize=False,
             add_generation_prompt=False,
         )
-        inputs = self.processor(text=[text], images=[sample.image], padding=False, return_tensors="pt")
+        inputs = self.processor(text=[text], images=[sample.sequence[0]], padding=False, return_tensors="pt")
 
         input_ids = inputs['input_ids']
 
@@ -266,6 +337,10 @@ class SingleBatchEncoder(TaskEncoder):
         return batch_out
 
 class PackedBatchEncoder(TaskEncoder):
+    # PIL image decode (uint8 [0,255]); avoids the float[0,1] -> double-rescale ->
+    # near-blank image bug with the HF processor. See utils/diff_image_preprocessing.py.
+    decoder = SampleDecoder(image_decode="pil")
+
     def __init__(self, processor, max_seq_len):
         super().__init__()
         self.processor = processor
@@ -278,8 +353,10 @@ class PackedBatchEncoder(TaskEncoder):
 
     cookers = [
         # subflavors can be used to distinguish datasets when using a Metadataset
-        Cooker(cooker_captioning),
-        #Cooker(cooker_llava_imagenet, has_subflavors={"type_dataset": "otro"}),
+        Cooker(cooker_captioning),  # fallback
+        Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth"}),
+        Cooker(cooker_llava_recap, has_subflavors={"type_dataset": "llava_recap"}),
+        Cooker(cooker_llava_imagenet, has_subflavors={"type_dataset": "llava_recap_mn5"}),
     ]
 
     # transform the RAW data, tokenize a single sample
@@ -290,7 +367,6 @@ class PackedBatchEncoder(TaskEncoder):
             tokenize=False,
             add_generation_prompt=False,
         )
-        #breakpoint()
         inputs = self.processor(text=[text], images=[sample.image], padding=False, return_tensors="pt")
 
         input_ids = inputs['input_ids']
@@ -334,6 +410,7 @@ class PackedBatchEncoder(TaskEncoder):
     
     def select_samples_to_pack(self, samples: list[EncodedSample]) -> list[list[EncodedSample]]:
         samples.sort(key=lambda x: x.length, reverse=True)
+        #samples = [samples[i // 2] if i % 2 == 0 else samples[-(i // 2) - 1] for i in range(len(samples))]
         groups = []
         while samples:
             current_group = [samples.pop(0)]
@@ -347,6 +424,8 @@ class PackedBatchEncoder(TaskEncoder):
                 else:
                     i += 1
             groups.append(current_group)
+
+        random.shuffle(groups)
         return groups
 
     # collate the batch into a single sample

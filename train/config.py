@@ -32,6 +32,10 @@ class Wandb:
     project_name: str = "test_151_qwen_vl"
     entity_name: str = "bsc_runs"
 
+    # per-rank Top-K performance logging
+    log_topk: bool = True
+    top_k: int = 4
+
 @dataclass
 class Training:
 
@@ -48,6 +52,10 @@ class Training:
     # whether or not to load the text model
     load_text_model: bool = False
     text_model_dir: str = "NULL"
+
+    # whether or not to load a pre-trained vision encoder (e.g. SigLIP2)
+    load_vision_model: bool = False
+    vision_model_dir: str = "NULL"
 
     # whether to resume from previous checkpoints or not
     resume_checkpoint: bool = False
